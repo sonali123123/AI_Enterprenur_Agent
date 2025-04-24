@@ -19,7 +19,9 @@ from langchain.chains.combine_documents import create_stuff_documents_chain
 from langchain_community.chat_message_histories import ChatMessageHistory
 from langchain_core.chat_history import BaseChatMessageHistory
 from langchain_core.runnables.history import RunnableWithMessageHistory
-from TTS.api import TTS
+import torch
+
+
 # App initialization
 app = FastAPI()
 
@@ -28,6 +30,12 @@ UPLOAD_AUDIO_DIR = Path("uploads/audio")
 RESPONSE_AUDIO_DIR = Path("responses/audio")
 for directory in (UPLOAD_AUDIO_DIR, RESPONSE_AUDIO_DIR, Path("chroma_db")):
     directory.mkdir(parents=True, exist_ok=True)
+
+# Device selection
+device = "cuda" if torch.cuda.is_available() else "cpu"
+print(f"Using device: {device}")
+
+
 
 # Load Whisper model globally
 whisper_model = whisper.load_model("turbo")
@@ -47,7 +55,7 @@ def load_pdfs(paths: list[str]):
     return docs
 
 # Load and split once at startup
-PDF_PATHS = ["data/book_1.pdf", "data/book_2.pdf", "data/book_3.pdf"]
+PDF_PATHS = ["data/book_1.pdf"]
 raw_docs = load_pdfs(PDF_PATHS)
 chunks = text_splitter.split_documents(raw_docs)
 print(f"Loaded and split {len(chunks)} document chunks.")
@@ -63,7 +71,7 @@ vectorstore = Chroma.from_documents(
 retriever = vectorstore.as_retriever(k=3)
 
 # LLM and RAG chain setup
-llm = ChatOllama(model="llama3.2:3B", temperature=0)
+llm = ChatOllama(model="llama3.2:3B", temperature=0,device=device)
 
 contextualize_q_system_prompt = """Given a chat history and the latest user question \
 which might reference context in the chat history, formulate a standalone question \
@@ -79,46 +87,6 @@ context_prompt = ChatPromptTemplate.from_messages([
 history_aware_retriever = create_history_aware_retriever(
     llm, retriever, context_prompt
 )
-
-# Mentor QA prompt
-# mentor_prompt_text ="""
-# ## System Prompt
-
-# You are an expert entrepreneurship mentor with deep experience guiding founders from ideation through launch and growth. 
-# Your role is to act as a personalized coach—never generic—tailoring every response to the user’s unique situation.
-# Always:
-#  • Move from broad concepts to concrete, actionable steps.
-#  • Offer best practices, real‑world examples, and “mentor‑style” guidance.
-#  • Maintain a supportive, motivational tone.
-#  • End with 3–4 suggested follow‑up questions the user can ask next.
-
-
-
-# ##  User Prompt
-
-# Context:
-# • Current topic: <e.g. “Validating my business idea in a competitive market”>
-# • User profile: <e.g. “Early‑stage founder with prototype but no paying customers”>
-
-# Task:
-# 1. Provide a structured response that:
-#    a. Starts with an overview of the concept at a high level.  
-#    b. Narrows down to specific tactics or steps the user can take right now.  
-#    c. Highlights 2–3 best practices or pitfalls to avoid.  
-
-# 2. Embed an interactive Q&A:
-#    • Ask clarifying questions where appropriate.  
-#    • Suggest 3–4 “Next Interaction Prompts” at the end, e.g.:  
-#      – “Would you like tips on pricing strategies?”  
-#      – “Shall we explore customer interview frameworks?”  
-#      – “Interested in funding options for this stage?”  
-#      – “Need advice on building a minimum viable product?”  
-
-# User’s input:
-# “<The user’s actual question or scenario here>”
-
-
-# {context}"""
 
 mentor_prompt_text = """
 ## System Prompt
@@ -158,6 +126,43 @@ Structure every response in the following way:
 
 {context}
 """
+# mentor_prompt_text = """
+# ## System Prompt
+
+# You are an Entrepreneur Mentor Bot, specifically designed to guide aspiring entrepreneurs with personalized, topic‑specific advice. Your mentorship role involves providing detailed and actionable recommendations tailored to each user’s specific entrepreneurship interests and queries. Avoid generic responses—always prioritize detailed, clear, and practical guidance.
+
+# Whenever a user asks a question, reply with a JSON object containing exactly three keys:
+
+# 1. **response**  
+#    A in‑depth, topic‑specific mentorship response that directly addresses the user’s query and offers concrete strategies or action steps.
+
+# 2. **interactive_engagement_question**  
+#    A single, thought‑provoking question that invites the user to reflect or share more detail.
+
+# 3. **suggestions**  
+#    An array of **3 to 4** concise, clear, on‑topic follow‑up question prompts (each ending with a question mark) that the user might ask next.
+
+# ---  
+# ### Example
+
+# **User:**  
+# "I'm interested in launching an online food delivery business targeting health‑conscious customers. Where should I start?"
+
+# **Assistant (output JSON):**  
+# ```json
+# {
+#   "response": "To launch your health‑focused food delivery service, begin by defining a clear niche—such as organic vegan bowls, keto snack packs, or locally sourced smoothie kits. Conduct targeted market research via surveys and focus groups to pinpoint your audience’s top pain points and flavor preferences. Build a minimum viable product (MVP) menu with 3–5 signature items to test demand. Establish partnerships with local suppliers for fresh ingredients, and choose a delivery partner or build an in‑house logistics system that ensures meals arrive fresh. Finally, craft branding that emphasizes both health benefits and convenience, and pilot your offering in one neighborhood before scaling.",
+#   "interactive_engagement_question": "Which specific dietary niche (e.g., vegan, keto, paleo) excites you most, and why?",
+#   "suggestions": [
+#     "What steps can I take to validate demand for my chosen dietary niche?",
+#     "How should I structure pricing to balance affordability and profitability?",
+#     "Which marketing channels will best reach health‑conscious customers?",
+#     "What operational challenges should I prepare for in meal preparation and delivery?"
+#   ]
+# }
+
+# {context}
+# """
 
 
 
@@ -249,12 +254,14 @@ async def ask(query: dict = Body(...), background_tasks: BackgroundTasks = None)
         # Prepare chat input
         input_message = message
         response = generate_response(input_message,session_id)
+        response = response.replace("Interactive Engagement Question:","" ).replace("\n", "")
         print(f"Response from conversational_rag_chain: {response}")
 
         print(f"Generated response: {response}")
 
         # 2. Parse out the pure response vs. suggestions
         main_resp, suggestions = parse_response_and_suggestions(response)
+        
         print(f"Main response: {main_resp}")
         print(f"Suggestions: {suggestions}")
 
@@ -305,18 +312,39 @@ def generate_response(query_text,session_id="default_session"):
         return {"error": str(e)}
 
 # Initialize once at startup (global)
-fastpitch = TTS(model_name="tts_models/en/ljspeech/fast_pitch")  # Fully-parallel TTS model with pitch prediction :contentReference[oaicite:1]{index=1}
+# fastpitch = TTS(model_name="tts_models/en/ljspeech/fast_pitch")  # Fully-parallel TTS model with pitch prediction :contentReference[oaicite:1]{index=1}
 TMP_AUDIO_DIR = Path("static/audio")
+
+# def generate_audio_from_response(response_text: str) -> Path:
+#     """
+#     Synthesize response_text using FastPitch and save to a .wav file.
+#     Returns the Path to the generated audio.
+#     """
+#     timestamp = int(time.time() * 1000)
+#     out_path = TMP_AUDIO_DIR / f"response_{timestamp}.wav"
+
+#     # Run synthesis (this blocks until file is written)
+#     fastpitch.tts_to_file(text=response_text, file_path=str(out_path))
+#     return out_path
+
+engine = pyttsx3.init()
+voices = engine.getProperty("voices")
+for v in voices:
+    if "male" in v.name.lower() or "male" in v.id:
+        engine.setProperty("voice", v.id)
+        break
 
 def generate_audio_from_response(response_text: str) -> Path:
     """
-    Synthesize `response_text` using FastPitch and save to a .wav file.
-    Returns the Path to the generated audio.
+    Synthesize `response_text` using pyttsx3 into an MP3
+    and return the Path to the saved file.
     """
-    timestamp = int(time.time() * 1000)
-    out_path = TMP_AUDIO_DIR / f"response_{timestamp}.wav"
+    # choose filename
+    ts = int(time.time() * 1000)
+    out_path = TMP_AUDIO_DIR / f"response_{ts}.mp3"
 
-    # Run synthesis (this blocks until file is written)
-    fastpitch.tts_to_file(text=response_text, file_path=str(out_path))
+    # queue up the save
+    engine.save_to_file(response_text, str(out_path))
+    engine.runAndWait()    # perform synthesis & write file
+
     return out_path
-
