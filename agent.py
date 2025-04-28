@@ -1,4 +1,4 @@
-from fastapi import FastAPI, File, UploadFile, BackgroundTasks, HTTPException, Body
+from fastapi import FastAPI, Request,UploadFile, File, UploadFile, BackgroundTasks, HTTPException, Body
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pathlib import Path
@@ -14,8 +14,13 @@ from langchain_core.runnables.history import RunnableWithMessageHistory
 from langchain_ollama import OllamaLLM
 from langchain_core.output_parsers import StrOutputParser
 import torch
+import numpy as np
+import io, asyncio
+from fastapi.responses import StreamingResponse
+from scipy.io import wavfile
 import pyttsx3
-
+import soundfile as sf
+import ffmpeg
 # App initialization
 app = FastAPI()
 
@@ -29,7 +34,7 @@ for directory in (UPLOAD_AUDIO_DIR, RESPONSE_AUDIO_DIR):
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
 # Load Whisper model once
-whisper_model = whisper.load_model("turbo")
+whisper_model = whisper.load_model("base")
 
 # Initialize TTS engine once
 tts_engine = pyttsx3.init()
@@ -156,8 +161,7 @@ def parse_response_and_suggestions(raw: str) -> tuple[str, list[str]]:
 
     return main_text, suggestions
 
-
-
+    
 @app.post("/whisper")
 async def whisper_endpoint(file: UploadFile = File(...)):
     path = UPLOAD_AUDIO_DIR / file.filename
@@ -166,6 +170,7 @@ async def whisper_endpoint(file: UploadFile = File(...)):
             f.write(await file.read())
         result = await asyncio.to_thread(whisper_model.transcribe, str(path))
         text = result.get("text", "")
+        print(text)
         os.remove(path)
         return JSONResponse({"transcription": text})
     except Exception as e:
@@ -199,7 +204,7 @@ async def ask(payload: dict = Body(...), background_tasks: BackgroundTasks = Non
     ts = int(time.time() * 1000)
     filename = f"response_{ts}.mp3"
     out_path = RESPONSE_AUDIO_DIR / filename
-    background_tasks.add_task(generate_audio_from_response, main_resp, out_path)
+    await asyncio.to_thread(generate_audio_from_response, main_resp, out_path) 
 
     return JSONResponse({
         "response": main_resp,
@@ -207,12 +212,38 @@ async def ask(payload: dict = Body(...), background_tasks: BackgroundTasks = Non
         "audio_url": f"http://10.7.0.28:5505/static/audio/{filename}"
     })
 
-# Synchronous TTS worker
-def generate_audio_from_response(response_text: str, out_path: Path) -> None:
-    tts_engine.save_to_file(response_text, str(out_path))
-    tts_engine.runAndWait()
+# # Synchronous TTS worker
+# def generate_audio_from_response(response_text: str, out_path: Path) -> None:
+#     tts_engine.save_to_file(response_text, str(out_path))
+#     tts_engine.runAndWait()
 
-    # extra safety: make sure data is on disk
+#     # extra safety: make sure data is on disk
+#     with open(out_path, "rb+") as f:
+#         f.flush()
+#         os.fsync(f.fileno())
+   
+import pyttsx3, os, stat
+
+def generate_audio_from_response(response_text: str, out_path: Path) -> None:
+    # 1. New engine for each file
+    engine = pyttsx3.init()
+    # (Re-apply your male-voice selection if needed)
+    for v in engine.getProperty("voices"):
+        if "male" in v.name.lower() or "male" in v.id:
+            engine.setProperty("voice", v.id)
+            break
+
+    engine.save_to_file(response_text, str(out_path))
+    engine.runAndWait()
+    engine.stop()
+
+    # 2. Flush to disk
     with open(out_path, "rb+") as f:
         f.flush()
-        os.fsync(f.fileno())
+        os.fsync(f.fileno())  
+
+    # 3. (Optional) loosen perms if on Unix
+    try:
+        out_path.chmod(stat.S_IRUSR | stat.S_IWUSR | stat.S_IRGRP | stat.S_IROTH)
+    except Exception:
+        pass
