@@ -211,3 +211,8 @@ async def ask(payload: dict = Body(...), background_tasks: BackgroundTasks = Non
 def generate_audio_from_response(response_text: str, out_path: Path) -> None:
     tts_engine.save_to_file(response_text, str(out_path))
     tts_engine.runAndWait()
+
+    # extra safety: make sure data is on disk
+    with open(out_path, "rb+") as f:
+        f.flush()
+        os.fsync(f.fileno())
